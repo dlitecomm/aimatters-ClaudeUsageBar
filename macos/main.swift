@@ -273,6 +273,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         set { UserDefaults.standard.set(newValue, forKey: "displayWindow") }
     }
 
+    // 갱신 주기(초) — 기본 3분. 잦은 요청은 API 429 제한을 유발할 수 있음
+    var refreshInterval: Double {
+        get { let v = UserDefaults.standard.double(forKey: "refreshInterval"); return v > 0 ? v : 180 }
+        set { UserDefaults.standard.set(newValue, forKey: "refreshInterval") }
+    }
+
+    func startTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+    }
+
     func updateTitle() {
         guard !lastWindows.isEmpty else { return }
         let target = lastWindows.first { $0.key == displayKey }
@@ -287,9 +300,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = "✳ …"
         rebuildMenu()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 180, repeats: true) { [weak self] _ in
-            self?.refresh()
-        }
+        startTimer()
     }
 
     func refresh() {
@@ -346,6 +357,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
+        let intervalHeader = NSMenuItem(title: "갱신 주기", action: nil, keyEquivalent: "")
+        intervalHeader.isEnabled = false
+        menu.addItem(intervalHeader)
+        let intervals: [(Double, String)] = [
+            (60, "1분"),
+            (120, "2분 (추천)"),
+            (180, "3분 (가장 추천)"),
+        ]
+        for (sec, label) in intervals {
+            let item = NSMenuItem(title: label, action: #selector(selectInterval(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = sec
+            item.state = (refreshInterval == sec) ? .on : .off
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
         let refreshItem = NSMenuItem(title: "지금 갱신", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
@@ -360,6 +387,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func selectDisplay(_ sender: NSMenuItem) {
         if let key = sender.representedObject as? String { displayKey = key }
         updateTitle()
+        rebuildMenu()
+    }
+
+    @objc func selectInterval(_ sender: NSMenuItem) {
+        if let sec = sender.representedObject as? Double {
+            refreshInterval = sec
+            startTimer()
+        }
         rebuildMenu()
     }
 }

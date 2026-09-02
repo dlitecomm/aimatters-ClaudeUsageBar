@@ -33,6 +33,19 @@ function Set-DisplayKey($k) {
     Set-ItemProperty -Path $script:CfgReg -Name DisplayWindow -Value $k
 }
 
+# 갱신 주기(초) — 기본 3분. 잦은 요청은 API 429 제한을 유발할 수 있음
+function Get-RefreshSec {
+    try {
+        $v = (Get-ItemProperty -Path $script:CfgReg -Name RefreshSec -ErrorAction Stop).RefreshSec
+        if ($v -ge 60) { return [int]$v }
+    } catch {}
+    return 180
+}
+function Set-RefreshSec($s) {
+    New-Item -Path $script:CfgReg -Force | Out-Null
+    Set-ItemProperty -Path $script:CfgReg -Name RefreshSec -Value ([int]$s) -Type DWord
+}
+
 function Get-FreshToken {
     if (-not (Test-Path $script:CredPath)) {
         throw "자격증명 없음 — 터미널에서 claude auth login 한 번 실행 필요"
@@ -193,6 +206,22 @@ function Update-Usage {
         }.GetNewClosure())
     }
     $menu.Items.Add("-") | Out-Null
+    foreach ($opt in @(@{s=60; l="갱신 주기: 1분"}, @{s=120; l="갱신 주기: 2분 (추천)"}, @{s=180; l="갱신 주기: 3분 (가장 추천)"})) {
+        $mi = $menu.Items.Add($opt.l)
+        $mi.Checked = ((Get-RefreshSec) -eq $opt.s)
+        $sec = $opt.s
+        $mi.add_Click({
+            param($s, $e)
+            Set-RefreshSec $sec
+            $script:timer.Interval = $sec * 1000
+            foreach ($it in $menu.Items) {
+                if ($it -is [System.Windows.Forms.ToolStripMenuItem] -and $it.Text -like "갱신 주기:*") {
+                    $it.Checked = ($it.Text -eq $s.Text)
+                }
+            }
+        }.GetNewClosure())
+    }
+    $menu.Items.Add("-") | Out-Null
     $refresh = $menu.Items.Add("지금 갱신")
     $refresh.add_Click({ Update-Usage })
     $exit = $menu.Items.Add("종료")
@@ -204,7 +233,7 @@ function Update-Usage {
 }
 
 $script:timer = New-Object System.Windows.Forms.Timer
-$script:timer.Interval = 180000  # 3분 (사용량 API가 잦은 요청에 429 제한을 걸 수 있음)
+$script:timer.Interval = (Get-RefreshSec) * 1000
 $script:timer.add_Tick({ Update-Usage })
 $script:timer.Start()
 
