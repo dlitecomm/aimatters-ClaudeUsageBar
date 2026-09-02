@@ -19,6 +19,20 @@ $script:WindowLabels = @{
 }
 $script:WindowOrder = @("five_hour","seven_day","seven_day_sonnet","seven_day_opus","seven_day_oauth_apps")
 
+# 아이콘에 표시할 기준 창 (five_hour | seven_day) — 레지스트리에 저장해 재시작 후 유지
+$script:CfgReg = "HKCU:\Software\ClaudeUsageBar"
+function Get-DisplayKey {
+    try {
+        $v = (Get-ItemProperty -Path $script:CfgReg -Name DisplayWindow -ErrorAction Stop).DisplayWindow
+        if ($v) { return $v }
+    } catch {}
+    return "five_hour"
+}
+function Set-DisplayKey($k) {
+    New-Item -Path $script:CfgReg -Force | Out-Null
+    Set-ItemProperty -Path $script:CfgReg -Name DisplayWindow -Value $k
+}
+
 function Get-FreshToken {
     if (-not (Test-Path $script:CredPath)) {
         throw "자격증명 없음 — 터미널에서 claude auth login 한 번 실행 필요"
@@ -107,19 +121,28 @@ $notify.Visible = $true
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $notify.ContextMenuStrip = $menu
 
+function Update-Icon {
+    if (-not $script:LastWindows) { return }
+    $dispKey = Get-DisplayKey
+    $sel = $script:LastWindows | Where-Object Key -eq $dispKey | Select-Object -First 1
+    if (-not $sel) { $sel = $script:LastWindows | Where-Object Key -eq "five_hour" | Select-Object -First 1 }
+    if (-not $sel) { $sel = $script:LastWindows[0] }
+    $pct = [int][math]::Round($sel.Utilization)
+    $color = if ($pct -lt 50) { [System.Drawing.Color]::LimeGreen }
+             elseif ($pct -lt 80) { [System.Drawing.Color]::Gold }
+             else { [System.Drawing.Color]::OrangeRed }
+    $text = if ($dispKey -eq "seven_day") { "주$pct" } else { "$pct" }
+    $old = $notify.Icon
+    $notify.Icon = New-PercentIcon $text $color
+    if ($old) { $old.Dispose() }
+}
+
 function Update-Usage {
     try {
         $windows = @(Get-Usage)
         if ($windows.Count -eq 0) { throw "사용량 데이터 없음" }
-        $five = $windows | Where-Object Key -eq "five_hour" | Select-Object -First 1
-        if (-not $five) { $five = $windows[0] }
-        $pct = [int][math]::Round($five.Utilization)
-        $color = if ($pct -lt 50) { [System.Drawing.Color]::LimeGreen }
-                 elseif ($pct -lt 80) { [System.Drawing.Color]::Gold }
-                 else { [System.Drawing.Color]::OrangeRed }
-        $old = $notify.Icon
-        $notify.Icon = New-PercentIcon "$pct" $color
-        if ($old) { $old.Dispose() }
+        $script:LastWindows = $windows
+        Update-Icon
 
         $lines = foreach ($w in $windows) {
             $label = $script:WindowLabels[$w.Key]; if (-not $label) { $label = $w.Key }
@@ -152,6 +175,22 @@ function Update-Usage {
         $menu.Items.Clear()
         $item = $menu.Items.Add("⚠ $msg")
         $item.Enabled = $false
+    }
+    $menu.Items.Add("-") | Out-Null
+    foreach ($opt in @(@{k="five_hour"; l="아이콘 기준: 5시간 창"}, @{k="seven_day"; l="아이콘 기준: 주간 한도"})) {
+        $mi = $menu.Items.Add($opt.l)
+        $mi.Checked = ((Get-DisplayKey) -eq $opt.k)
+        $key = $opt.k
+        $mi.add_Click({
+            param($s, $e)
+            Set-DisplayKey $key
+            Update-Icon
+            foreach ($it in $menu.Items) {
+                if ($it -is [System.Windows.Forms.ToolStripMenuItem] -and $it.Text -like "아이콘 기준:*") {
+                    $it.Checked = ($it.Text -eq $s.Text)
+                }
+            }
+        }.GetNewClosure())
     }
     $menu.Items.Add("-") | Out-Null
     $refresh = $menu.Items.Add("지금 갱신")

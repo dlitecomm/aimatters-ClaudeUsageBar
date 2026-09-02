@@ -267,6 +267,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lastError: String?
     var lastUpdate: Date?
 
+    // 상태바에 표시할 기준 창 (five_hour | seven_day) — 재시작 후에도 유지
+    var displayKey: String {
+        get { UserDefaults.standard.string(forKey: "displayWindow") ?? "five_hour" }
+        set { UserDefaults.standard.set(newValue, forKey: "displayWindow") }
+    }
+
+    func updateTitle() {
+        guard !lastWindows.isEmpty else { return }
+        let target = lastWindows.first { $0.key == displayKey }
+            ?? lastWindows.first { $0.key == "five_hour" }
+            ?? lastWindows[0]
+        let prefix = displayKey == "seven_day" ? "주" : ""
+        statusItem.button?.title = "✳ \(prefix)\(Int(target.utilization.rounded()))%"
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "✳ …"
@@ -286,8 +301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.lastWindows = windows
                     self.lastError = nil
                     self.lastUpdate = Date()
-                    let five = windows.first { $0.key == "five_hour" } ?? windows[0]
-                    self.statusItem.button?.title = "✳ \(Int(five.utilization.rounded()))%"
+                    self.updateTitle()
                 case .failure(let msg):
                     self.lastError = msg
                     // 이전 정상 수치가 있으면 유지하고, 없을 때만 오류 표시
@@ -321,6 +335,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
+        let header = NSMenuItem(title: "상태바 표시 기준", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        for (key, label) in [("five_hour", "5시간 창"), ("seven_day", "주간 한도")] {
+            let item = NSMenuItem(title: label, action: #selector(selectDisplay(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = key
+            item.state = (displayKey == key) ? .on : .off
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
         let refreshItem = NSMenuItem(title: "지금 갱신", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
@@ -331,6 +356,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func refreshNow() { refresh() }
+
+    @objc func selectDisplay(_ sender: NSMenuItem) {
+        if let key = sender.representedObject as? String { displayKey = key }
+        updateTitle()
+        rebuildMenu()
+    }
 }
 
 let app = NSApplication.shared
