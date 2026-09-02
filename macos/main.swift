@@ -297,18 +297,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // 노치 맥북은 메뉴바 공간이 부족하면 아이콘을 통째로 숨기므로 폭을 최소화한다.
+    func setBarText(_ s: String) {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        statusItem.button?.attributedTitle = NSAttributedString(string: s, attributes: [.font: font])
+    }
+
     func updateTitle() {
         guard !lastWindows.isEmpty else { return }
         let target = lastWindows.first { $0.key == displayKey }
             ?? lastWindows.first { $0.key == "five_hour" }
             ?? lastWindows[0]
         let prefix = displayKey == "seven_day" ? "주" : ""
-        statusItem.button?.title = "✳ \(prefix)\(Int(target.utilization.rounded()))%"
+        setBarText("✳\(prefix)\(Int(target.utilization.rounded()))%")
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "✳ …"
+        statusItem.autosaveName = "ClaudeUsageBar" // 사용자가 ⌘드래그로 옮긴 위치를 기억
+        setBarText("✳…")
         rebuildMenu()
         refresh()
         startTimer()
@@ -328,7 +335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.lastError = msg
                     // 이전 정상 수치가 있으면 유지하고, 없을 때만 오류 표시
                     if self.lastWindows.isEmpty {
-                        self.statusItem.button?.title = "✳ –"
+                        self.setBarText("✳–")
                     }
                 }
                 self.rebuildMenu()
