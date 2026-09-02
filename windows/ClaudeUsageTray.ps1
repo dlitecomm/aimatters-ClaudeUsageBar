@@ -137,8 +137,11 @@ function Update-Usage {
         }
         $t = $menu.Items.Add(("마지막 갱신 {0:HH\:mm\:ss}" -f (Get-Date)))
         $t.Enabled = $false
+        $script:HadSuccess = $true
     }
     catch {
+        # 이전 정상 수치가 있으면 유지 (429 등 일시 오류로 화면을 덮지 않음)
+        if ($script:HadSuccess) { return }
         $msg = $_.Exception.Message
         $old = $notify.Icon
         $notify.Icon = New-PercentIcon "!" ([System.Drawing.Color]::OrangeRed)
@@ -162,7 +165,7 @@ function Update-Usage {
 }
 
 $script:timer = New-Object System.Windows.Forms.Timer
-$script:timer.Interval = 60000
+$script:timer.Interval = 180000  # 3분 (사용량 API가 잦은 요청에 429 제한을 걸 수 있음)
 $script:timer.add_Tick({ Update-Usage })
 $script:timer.Start()
 

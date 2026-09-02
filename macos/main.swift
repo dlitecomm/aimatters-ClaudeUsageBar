@@ -203,6 +203,9 @@ func fetchUsage(completion: @escaping (Result<[UsageWindow], String>) -> Void) {
                     completion(.failure("응답 없음")); return
                 }
                 guard http.statusCode == 200 else {
+                    if http.statusCode == 429 {
+                        completion(.failure("일시 요청 제한 — 다음 갱신 때 자동 재시도")); return
+                    }
                     let body = String(data: data, encoding: .utf8)?.prefix(200) ?? ""
                     completion(.failure("API 오류 \(http.statusCode): \(body)")); return
                 }
@@ -269,7 +272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = "✳ …"
         rebuildMenu()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 180, repeats: true) { [weak self] _ in
             self?.refresh()
         }
     }
@@ -287,7 +290,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.statusItem.button?.title = "✳ \(Int(five.utilization.rounded()))%"
                 case .failure(let msg):
                     self.lastError = msg
-                    self.statusItem.button?.title = "✳ –"
+                    // 이전 정상 수치가 있으면 유지하고, 없을 때만 오류 표시
+                    if self.lastWindows.isEmpty {
+                        self.statusItem.button?.title = "✳ –"
+                    }
                 }
                 self.rebuildMenu()
             }
