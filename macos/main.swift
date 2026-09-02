@@ -39,7 +39,11 @@ func keychainRead(account: String) -> Data? {
     return ref as? Data
 }
 
+// 실행 중에는 메모리 캐시를 사용해 키체인 접근(=허용 프롬프트 기회)을 최소화한다.
+var cachedStore: CredStore?
+
 func loadStore() -> Result<CredStore, String> {
+    if let c = cachedStore { return .success(c) }
     // 같은 서비스에 계정별 항목이 있을 수 있으므로 계정 목록을 먼저 얻는다.
     let listQuery: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
@@ -78,6 +82,7 @@ func loadStore() -> Result<CredStore, String> {
         }
         return .failure("계정 토큰 없음 — 터미널에서 claude auth login 한 번 실행 필요")
     }
+    cachedStore = store
     return .success(store)
 }
 
@@ -131,6 +136,7 @@ func refreshToken(store: CredStore, completion: @escaping (Result<CredStore, Str
         }
         newStore.obj["claudeAiOauth"] = oauth
         saveStore(newStore) // 갱신 토큰이 회전되므로 반드시 저장소에 되써야 CLI 로그인도 유지됨
+        cachedStore = newStore
         completion(.success(newStore))
     }.resume()
 }
@@ -205,6 +211,11 @@ func fetchUsage(completion: @escaping (Result<[UsageWindow], String>) -> Void) {
                 guard http.statusCode == 200 else {
                     if http.statusCode == 429 {
                         completion(.failure("일시 요청 제한 — 다음 갱신 때 자동 재시도")); return
+                    }
+                    if http.statusCode == 401 {
+                        // 캐시된 토큰이 무효 — 다음 갱신 때 저장소에서 다시 읽음
+                        cachedStore = nil
+                        completion(.failure("인증 만료 — 다음 갱신 때 자동 재시도")); return
                     }
                     let body = String(data: data, encoding: .utf8)?.prefix(200) ?? ""
                     completion(.failure("API 오류 \(http.statusCode): \(body)")); return
