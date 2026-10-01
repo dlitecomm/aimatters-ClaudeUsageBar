@@ -2,19 +2,29 @@ import Cocoa
 
 extension String: @retroactive Error {}
 
-// MARK: - 자격증명 저장소 (Claude Code가 저장한 OAuth 토큰)
-// macOS: 키체인 서비스 "Claude Code-credentials" / 폴백: ~/.claude/.credentials.json
-// 토큰이 만료되면 refreshToken으로 직접 갱신하고 저장소에 다시 써 둔다.
+// MARK: - 자격증명 (Claude Code가 저장한 OAuth 토큰)
+//
+// 토큰 출처 우선순위:
+//  1) ~/.claude/cubr-token  — 사용자가 직접 넣어둔 장기 토큰(선택). 갱신 없음.
+//  2) Claude Code 키체인 항목 — Apple 정식 도구 /usr/bin/security 로 읽는다.
+//     키체인은 security 도구를 기본 신뢰하므로 허용 창이 뜨지 않고, Claude Code가
+//     항목을 다시 만들어도 영향이 없다. (앱이 Security 프레임워크로 직접 읽으면
+//     항목이 재생성될 때마다 허용 창이 다시 뜬다 — 그래서 쓰지 않는다.)
+//  3) ~/.claude/.credentials.json — 리눅스/윈도우식 파일 저장 폴백.
+//
+// 토큰 갱신: 만료되면 먼저 원본을 다시 읽는다(Claude Code가 이미 갱신했을 수 있음).
+// 그래도 만료면 refreshToken으로 갱신하고 **원본에 되쓴다**. 복사본을 따로 갱신하면
+// 갱신 토큰 회전 때문에 Claude Code 쪽과 충돌해 둘 중 하나가 죽는다.
 
 let kService = "Claude Code-credentials"
-let kOwnService = "ClaudeUsageBar" // 앱 소유 항목 — 자기가 만든 항목은 접근 프롬프트가 없다
 let kClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e" // Claude Code 공개 OAuth 클라이언트
 let kTokenURL = "https://console.anthropic.com/v1/oauth/token"
 let kUsageURL = "https://api.anthropic.com/api/oauth/usage"
 
 enum CredSource {
-    case own       // 앱 소유 키체인 항목 (기본 경로 — 프롬프트 없음)
-    case file(URL) // ~/.claude/.credentials.json 폴백
+    case tokenFile            // ~/.claude/cubr-token (갱신 불가)
+    case cli(account: String) // Claude Code 키체인 항목 (security 도구 경유)
+    case file(URL)            // ~/.claude/.credentials.json
 }
 
 struct CredStore {
@@ -25,66 +35,101 @@ struct CredStore {
     var accessToken: String? { oauth?["accessToken"] as? String }
     var refreshToken: String? { oauth?["refreshToken"] as? String }
     var expiresAt: Double? { oauth?["expiresAt"] as? Double } // ms epoch
-}
-
-func keychainRead(service: String, account: String) -> (Data?, OSStatus) {
-    let q: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: service,
-        kSecAttrAccount as String: account,
-        kSecReturnData as String: true,
-        kSecMatchLimit as String: kSecMatchLimitOne,
-    ]
-    var ref: CFTypeRef?
-    let status = SecItemCopyMatching(q as CFDictionary, &ref)
-    return (status == errSecSuccess ? ref as? Data : nil, status)
-}
-
-func ownItemWrite(_ data: Data) {
-    let q: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: kOwnService,
-        kSecAttrAccount as String: "default",
-    ]
-    let status = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-    if status == errSecItemNotFound {
-        var add = q
-        add[kSecValueData as String] = data
-        SecItemAdd(add as CFDictionary, nil)
+    var isExpired: Bool {
+        guard let exp = expiresAt else { return false }
+        return exp / 1000 < Date().timeIntervalSince1970 + 60
     }
 }
 
-// 실행 중에는 메모리 캐시를 사용해 키체인 접근(=허용 프롬프트 기회)을 최소화한다.
-var cachedStore: CredStore?
-// Claude Code의 키체인 항목은 앱 시작 시 1회만 읽어 자기 항목으로 복사한다.
-// 거부되면 자동 재시도하지 않고(허용 창 반복 방지) '지금 갱신'을 눌렀을 때만 다시 시도한다.
-var keychainBlocked = false
+/// /usr/bin/security 실행. 허용 창이 떠서 응답을 기다리는 경우를 대비해 시간 제한을 둔다.
+func runSecurity(_ args: [String], timeout: TimeInterval = 45) -> (out: String, err: String, code: Int32, timedOut: Bool) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    p.arguments = args
+    let outPipe = Pipe(), errPipe = Pipe()
+    p.standardOutput = outPipe
+    p.standardError = errPipe
+    do { try p.run() } catch { return ("", "\(error)", -1, false) }
+    let deadline = Date().addingTimeInterval(timeout)
+    while p.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
+    var timedOut = false
+    if p.isRunning { p.terminate(); timedOut = true }
+    let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return (out, err, p.terminationStatus, timedOut)
+}
 
-func loadStore() -> Result<CredStore, String> {
-    if let c = cachedStore { return .success(c) }
-
-    // 1) 수동 등록 토큰 파일 — `claude setup-token`으로 발급한 장기 토큰.
-    //    키체인을 전혀 거치지 않는 최우선 경로 (프롬프트 원천 차단).
-    let tokenPath = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".claude/cubr-token")
-    if let raw = try? String(contentsOf: tokenPath, encoding: .utf8) {
-        // 파일 안 어디에 있든 sk-ant-… 토큰만 뽑아낸다 (앞뒤 공백·다른 텍스트 허용)
-        if let r = raw.range(of: #"sk-ant-[A-Za-z0-9_\-]{20,}"#, options: .regularExpression) {
-            let tok = String(raw[r])
-            let store = CredStore(obj: ["claudeAiOauth": ["accessToken": tok]], source: .own)
-            cachedStore = store
-            return .success(store)
+/// Claude Code 키체인 항목을 읽는다. 실패 사유를 메시지로 돌려준다.
+func readCLIItem() -> Result<CredStore, String> {
+    // 계정 이름(acct)부터 — 비밀값 없이 속성만 출력된다
+    let meta = runSecurity(["find-generic-password", "-s", kService], timeout: 15)
+    if meta.code != 0 {
+        if meta.err.contains("could not be found") {
+            return .failure("Claude Code 로그인 정보 없음 — 터미널에서 claude auth login 실행 필요")
+        }
+        return .failure("키체인 조회 실패: \(meta.err.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+    var account = ""
+    if let r = meta.out.range(of: #""acct"<blob>="([^"]*)""#, options: .regularExpression) {
+        let line = String(meta.out[r])
+        if let q1 = line.range(of: "=\""), let q2 = line.range(of: "\"", options: .backwards) {
+            account = String(line[q1.upperBound..<q2.lowerBound])
         }
     }
+    var args = ["find-generic-password", "-s", kService]
+    if !account.isEmpty { args += ["-a", account] }
+    args.append("-w")
+    let r = runSecurity(args)
+    if r.timedOut {
+        return .failure("키체인 허용 창 응답 대기 중 시간 초과 — 메뉴의 '지금 갱신'으로 재시도")
+    }
+    guard r.code == 0 else {
+        if r.err.contains("User interaction is not allowed") || r.err.contains("canceled") {
+            return .failure("키체인 접근이 거부됨 — 메뉴의 '지금 갱신'으로 재시도")
+        }
+        return .failure("키체인 읽기 실패: \(r.err.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+    guard let data = r.out.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return .failure("키체인 항목 형식을 해석할 수 없음")
+    }
+    let store = CredStore(obj: o, source: .cli(account: account))
+    guard store.accessToken != nil else {
+        return .failure("키체인 항목에 계정 토큰 없음 — claude auth login 실행 필요")
+    }
+    return .success(store)
+}
 
-    // 1.5) 앱 소유 키체인 항목
-    let (ownData, _) = keychainRead(service: kOwnService, account: "default")
-    if let d = ownData, let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
-        let store = CredStore(obj: o, source: .own)
-        if store.accessToken != nil { cachedStore = store; return .success(store) }
+/// Claude Code 키체인 항목에 되쓴다 (-U: 기존 항목 갱신). security 도구가 쓰므로 허용 창 없음.
+func writeCLIItem(account: String, json: Data) {
+    guard let s = String(data: json, encoding: .utf8) else { return }
+    var args = ["add-generic-password", "-U", "-s", kService]
+    if !account.isEmpty { args += ["-a", account] }
+    args += ["-w", s]
+    _ = runSecurity(args, timeout: 15)
+}
+
+// 실행 중에는 메모리 캐시를 쓴다. 만료·401 때만 다시 읽는다.
+var cachedStore: CredStore?
+
+func loadStore(force: Bool = false) -> Result<CredStore, String> {
+    if !force, let c = cachedStore { return .success(c) }
+
+    // 1) 수동 등록 토큰 파일
+    let tokenPath = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".claude/cubr-token")
+    if let raw = try? String(contentsOf: tokenPath, encoding: .utf8),
+       let r = raw.range(of: #"sk-ant-[A-Za-z0-9_\-]{20,}"#, options: .regularExpression) {
+        let store = CredStore(obj: ["claudeAiOauth": ["accessToken": String(raw[r])]], source: .tokenFile)
+        cachedStore = store
+        return .success(store)
     }
 
-    // 2) 파일 폴백 (~/.claude/.credentials.json — 프롬프트 없음)
+    // 2) Claude Code 키체인 항목 (security 도구)
+    let cli = readCLIItem()
+    if case .success(let store) = cli { cachedStore = store; return .success(store) }
+
+    // 3) 파일 폴백
     let path = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/.credentials.json")
     if let d = try? Data(contentsOf: path),
@@ -93,61 +138,32 @@ func loadStore() -> Result<CredStore, String> {
         if store.accessToken != nil { cachedStore = store; return .success(store) }
     }
 
-    // 3) 부트스트랩: Claude Code CLI의 키체인 항목에서 1회 복사.
-    //    여기서만 시스템 허용 창이 뜰 수 있고, 거부되면 자동으로 다시 두드리지 않는다.
-    if keychainBlocked {
-        return .failure("키체인 접근 보류 중 — 메뉴의 '지금 갱신'을 누르면 다시 시도합니다")
-    }
-    let listQuery: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: kService,
-        kSecReturnAttributes as String: true,
-        kSecMatchLimit as String: kSecMatchLimitAll,
-    ]
-    var listRef: CFTypeRef?
-    let listStatus = SecItemCopyMatching(listQuery as CFDictionary, &listRef)
-    var accounts: [String] = []
-    if listStatus == errSecSuccess {
-        let attrsList = (listRef as? [[String: Any]]) ?? (listRef as? [String: Any]).map { [$0] } ?? []
-        accounts = attrsList.compactMap { $0[kSecAttrAccount as String] as? String }
-    }
-    var lastStatus: OSStatus = listStatus
-    for account in accounts {
-        let (d, status) = keychainRead(service: kService, account: account)
-        lastStatus = status
-        guard let d = d,
-              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-              let oauth = o["claudeAiOauth"] as? [String: Any],
-              oauth["accessToken"] is String else { continue }
-        // 자기 소유 항목으로 복사 — 이후로는 프롬프트 없이 여기만 사용
-        let obj: [String: Any] = ["claudeAiOauth": oauth]
-        if let data = try? JSONSerialization.data(withJSONObject: obj) { ownItemWrite(data) }
-        let store = CredStore(obj: obj, source: .own)
-        cachedStore = store
-        return .success(store)
-    }
-    if lastStatus == errSecUserCanceled || lastStatus == errSecAuthFailed || lastStatus == errSecInteractionNotAllowed {
-        keychainBlocked = true
-        return .failure("키체인 접근이 거부됨 — 메뉴의 '지금 갱신'으로 재시도 (허용 창에서 '허용' 한 번이면 됩니다)")
-    }
-    return .failure("토큰 없음 — 터미널에서 claude setup-token 발급 후 ~/.claude/cubr-token 에 저장")
+    return cli // 키체인 쪽 실패 사유를 그대로 보여준다
 }
 
 func saveStore(_ store: CredStore) {
     guard let data = try? JSONSerialization.data(withJSONObject: store.obj) else { return }
     switch store.source {
-    case .own:
-        ownItemWrite(data) // 자기 항목이라 프롬프트 없음
-    case .file(let url):
-        try? data.write(to: url, options: .atomic)
+    case .tokenFile: break
+    case .cli(let account): writeCLIItem(account: account, json: data)
+    case .file(let url): try? data.write(to: url, options: .atomic)
     }
+}
+
+/// 예전 버전이 만들었던 앱 소유 키체인 항목 정리 (우리 항목이라 허용 창 없음)
+func removeLegacyOwnItem() {
+    let q: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "ClaudeUsageBar",
+    ]
+    SecItemDelete(q as CFDictionary)
 }
 
 // MARK: - 토큰 갱신
 
 func refreshToken(store: CredStore, completion: @escaping (Result<CredStore, String>) -> Void) {
     guard let refresh = store.refreshToken else {
-        completion(.failure("토큰 만료 + 갱신 토큰 없음 — claude auth login 다시 실행 필요"))
+        completion(.failure("토큰 만료 (갱신 토큰 없음) — Claude Code를 한 번 실행하거나 claude auth login"))
         return
     }
     var req = URLRequest(url: URL(string: kTokenURL)!)
@@ -166,7 +182,8 @@ func refreshToken(store: CredStore, completion: @escaping (Result<CredStore, Str
               let access = o["access_token"] as? String
         else {
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            completion(.failure("토큰 갱신 실패(\(code)) — claude auth login 다시 실행 필요"))
+            cachedStore = nil // 다음 갱신 때 원본을 다시 읽는다
+            completion(.failure("토큰 갱신 실패(\(code)) — Claude Code를 한 번 실행해 로그인을 갱신해 주세요"))
             return
         }
         var newStore = store
@@ -177,24 +194,21 @@ func refreshToken(store: CredStore, completion: @escaping (Result<CredStore, Str
             oauth["expiresAt"] = (Date().timeIntervalSince1970 + expiresIn) * 1000
         }
         newStore.obj["claudeAiOauth"] = oauth
-        // 갱신 토큰이 회전되므로 앱 소유 저장소에 되써 둔다.
-        // CLI 쪽 항목은 건드리지 않으므로(프롬프트 방지) CLI 로그인이 나중에 풀릴 수 있는데,
-        // 그때는 claude auth login 을 다시 하면 되고 앱에는 영향이 없다.
-        saveStore(newStore)
+        saveStore(newStore) // 원본에 되써서 Claude Code와 같은 토큰 체인을 유지
         cachedStore = newStore
         completion(.success(newStore))
     }.resume()
 }
 
 func withFreshToken(completion: @escaping (Result<String, String>) -> Void) {
-    switch loadStore() {
+    var result = loadStore()
+    // 캐시된 토큰이 만료됐으면 원본을 다시 읽는다 — Claude Code가 이미 갱신해 뒀을 수 있다
+    if case .success(let s) = result, s.isExpired { result = loadStore(force: true) }
+    switch result {
     case .failure(let msg): completion(.failure(msg))
     case .success(let store):
-        let now = Date().timeIntervalSince1970
-        if let exp = store.expiresAt, exp / 1000 < now + 60 {
-            refreshToken(store: store) { result in
-                completion(result.map { $0.accessToken ?? "" })
-            }
+        if store.isExpired {
+            refreshToken(store: store) { r in completion(r.map { $0.accessToken ?? "" }) }
         } else {
             completion(.success(store.accessToken ?? ""))
         }
@@ -348,16 +362,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.attributedTitle = NSAttributedString(string: s, attributes: [.font: font])
     }
 
+    // 마지막 성공 후 이만큼 지나면 '오래된 값'으로 본다 (갱신 주기 3회분 + 여유)
+    var isStale: Bool {
+        guard let t = lastUpdate else { return true }
+        return Date().timeIntervalSince(t) > refreshInterval * 3 + 60
+    }
+
     func updateTitle() {
         guard !lastWindows.isEmpty else { return }
         let target = lastWindows.first { $0.key == displayKey }
             ?? lastWindows.first { $0.key == "five_hour" }
             ?? lastWindows[0]
         let prefix = displayKey == "seven_day" ? "주" : ""
-        setBarText("✳\(prefix)\(Int(target.utilization.rounded()))%")
+        // 갱신이 끊긴 채 옛 수치를 보여줄 때는 ⚠ 를 붙여 정상값처럼 보이지 않게 한다
+        let mark = (lastError != nil || isStale) ? "⚠" : ""
+        setBarText("✳\(prefix)\(Int(target.utilization.rounded()))%\(mark)")
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        removeLegacyOwnItem()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.autosaveName = "ClaudeUsageBar" // 사용자가 ⌘드래그로 옮긴 위치를 기억
         setBarText("✳…")
@@ -366,24 +389,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startTimer()
     }
 
+    var refreshing = false
+
     func refresh() {
-        fetchUsage { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                switch result {
-                case .success(let windows):
-                    self.lastWindows = windows
-                    self.lastError = nil
-                    self.lastUpdate = Date()
-                    self.updateTitle()
-                case .failure(let msg):
-                    self.lastError = msg
-                    // 이전 정상 수치가 있으면 유지하고, 없을 때만 오류 표시
-                    if self.lastWindows.isEmpty {
-                        self.setBarText("✳–")
+        if refreshing { return } // 허용 창 대기 등으로 길어질 때 중복 실행 방지
+        refreshing = true
+        // 키체인 조회가 길어져도(허용 창 대기) 메뉴바가 멈추지 않도록 백그라운드에서 실행
+        DispatchQueue.global(qos: .utility).async {
+            fetchUsage { [weak self] result in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.refreshing = false
+                    switch result {
+                    case .success(let windows):
+                        self.lastWindows = windows
+                        self.lastError = nil
+                        self.lastUpdate = Date()
+                    case .failure(let msg):
+                        self.lastError = msg
                     }
+                    if self.lastWindows.isEmpty {
+                        self.setBarText(self.lastError == nil ? "✳…" : "✳–")
+                    } else {
+                        self.updateTitle() // 옛 수치 유지 + 오류 시 ⚠ 표시
+                    }
+                    self.rebuildMenu()
                 }
-                self.rebuildMenu()
             }
         }
     }
@@ -403,8 +434,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
         if let t = lastUpdate {
-            let fmt = DateFormatter(); fmt.dateFormat = "HH:mm:ss"
-            let item = NSMenuItem(title: "마지막 갱신 \(fmt.string(from: t))", action: nil, keyEquivalent: "")
+            let fmt = DateFormatter()
+            fmt.dateFormat = Calendar.current.isDateInToday(t) ? "HH:mm:ss" : "M/d HH:mm"
+            let note = isStale ? " (오래된 값)" : ""
+            let item = NSMenuItem(title: "마지막 갱신 \(fmt.string(from: t))\(note)", action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
         }
@@ -446,7 +479,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func refreshNow() {
-        keychainBlocked = false // 수동 갱신 때만 부트스트랩 재시도 허용
+        cachedStore = nil // 수동 갱신은 토큰도 원본에서 다시 읽는다
         refresh()
     }
 

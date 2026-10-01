@@ -23,13 +23,15 @@ claude auth login
 - **삭제**: `CUBR-삭제.command` 더블클릭 — 앱 종료, 로그인 항목 해제, `/Applications`에서 제거.
 - **재설치**: 그냥 `CUBR-설치.command`를 다시 더블클릭 (기존 설치를 덮어씀).
 
-첫 실행 때 키체인 접근 창이 **한 번** 뜨면 비밀번호 입력 후 **"항상 허용"** 클릭. 앱은 이때 Claude Code의 토큰을 자기 소유 키체인 항목(`ClaudeUsageBar`)으로 복사해 두고, 이후로는 Claude Code 항목을 다시 읽지 않는다 — `claude auth login`을 다시 하거나 재부팅해도 더는 묻지 않는다. 승인 창에서 취소하면 자동으로 재시도하지 않으며, 메뉴의 "지금 갱신"을 누를 때만 다시 시도한다.
+토큰은 Claude Code가 키체인에 저장한 것을 Apple 정식 도구(`/usr/bin/security`)로 읽는다. 키체인이 기본 신뢰하는 도구라 **허용 창이 뜨지 않고**, `claude auth login`으로 항목이 다시 만들어져도 영향이 없다. 토큰이 만료되면 원본을 다시 읽고(Claude Code가 이미 갱신했을 수 있음), 그래도 만료면 직접 갱신해 원본에 되쓴다 — 복사본을 따로 갱신하면 Claude Code와 토큰 체인이 충돌해 둘 중 하나가 죽기 때문이다.
 
-터미널 검증: `/Applications/ClaudeUsageBar.app/Contents/MacOS/ClaudeUsageBar --once` (메뉴바 앱이 승인을 마친 뒤에 실행할 것 — 동시에 실행하면 승인 창이 두 번 뜬다)
+갱신이 끊긴 채 옛 수치를 보여줄 때는 상태바에 `⚠`가 붙고 메뉴에 "(오래된 값)"이 표시된다. 그 상태로 오래 가면 메뉴의 "지금 갱신"을 누르거나 Claude Code를 한 번 실행해 로그인을 갱신한다.
 
-토큰 우선순위: `~/.claude/cubr-token`(선택 — `claude setup-token`으로 발급한 장기 토큰을 넣어두면 키체인을 전혀 거치지 않음) → 앱 소유 키체인 항목 → `~/.claude/.credentials.json` → Claude Code 키체인 항목(최초 1회 복사)
+터미널 검증: `/Applications/ClaudeUsageBar.app/Contents/MacOS/ClaudeUsageBar --once`
 
-빌드 시 "codesign이 키에 접근" 창이 뜨는 건 서명 키 쪽 승인이라 앱 사용과 무관하다. 매번 뜨는 게 번거로우면 터미널에서 한 번 실행: `security set-key-partition-list -S apple-tool:,apple: -s -k "<맥 로그인 비밀번호>" ~/Library/Keychains/login.keychain-db`
+토큰 우선순위: `~/.claude/cubr-token`(선택 — `claude setup-token`으로 발급한 장기 토큰) → Claude Code 키체인 항목(security 도구) → `~/.claude/.credentials.json`
+
+빌드 시 "codesign이 키에 접근" 창이 뜨는 건 서명 키 쪽 승인이라 앱 사용과 무관하다.
 
 ## 윈도우 (windows/)
 
