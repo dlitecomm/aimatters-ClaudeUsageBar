@@ -372,8 +372,13 @@ func parseUsage(_ data: Data) -> [UsageWindow] {
     isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     var out: [UsageWindow] = []
     for (key, value) in obj {
-        guard let dict = value as? [String: Any], var util = dict["utilization"] as? Double else { continue }
-        if util <= 1.0 { util *= 100 } // 0-1 스케일로 올 경우 대비
+        // 5시간·주간 창이 null이면 그 창에 사용 기록이 없다는 뜻 → 0%로 표시
+        if value is NSNull, key == "five_hour" || key == "seven_day" {
+            out.append(UsageWindow(key: key, utilization: 0, resetsAt: nil))
+            continue
+        }
+        // utilization 은 이미 0~100 퍼센트다 (2.0 = 2%). 비율로 보고 ×100 하면 1%가 100%로 보인다.
+        guard let dict = value as? [String: Any], let util = dict["utilization"] as? Double else { continue }
         var resets: Date?
         if let s = dict["resets_at"] as? String {
             resets = isoFrac.date(from: s) ?? iso.date(from: s)
@@ -416,6 +421,9 @@ func fetchUsage(completion: @escaping (Result<[UsageWindow], String>) -> Void) {
                     }
                     let body = String(data: data, encoding: .utf8)?.prefix(200) ?? ""
                     completion(.failure("API 오류 \(http.statusCode): \(body)")); return
+                }
+                if CommandLine.arguments.contains("--raw") {
+                    print(String(data: data, encoding: .utf8) ?? "")
                 }
                 let windows = parseUsage(data)
                 if windows.isEmpty {

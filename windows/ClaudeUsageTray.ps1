@@ -142,9 +142,14 @@ function Get-Usage {
     $windows = @()
     foreach ($prop in $resp.PSObject.Properties) {
         $v = $prop.Value
-        if ($null -ne $v -and $v.PSObject.Properties["utilization"]) {
+        # 5시간·주간 창이 null이면 그 창에 사용 기록이 없다는 뜻 → 0%로 표시
+        if ($null -eq $v -and ($prop.Name -eq "five_hour" -or $prop.Name -eq "seven_day")) {
+            $windows += [pscustomobject]@{ Key = $prop.Name; Utilization = 0.0; ResetsAt = $null }
+            continue
+        }
+        if ($null -ne $v -and $v.PSObject.Properties["utilization"] -and $null -ne $v.utilization) {
+            # utilization 은 이미 0~100 퍼센트다 (2.0 = 2%). ×100 하면 1%가 100%로 보인다.
             $util = [double]$v.utilization
-            if ($util -le 1.0) { $util *= 100 }  # 0-1 스케일 대비
             $resets = $null
             if ($v.PSObject.Properties["resets_at"] -and $v.resets_at) {
                 try { $resets = ([DateTimeOffset]::Parse($v.resets_at)).LocalDateTime } catch {}
